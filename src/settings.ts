@@ -1,6 +1,6 @@
 import { App, Notice, PluginSettingTab, SecretComponent, Setting } from "obsidian";
 import type { ImageSizeStyle } from "./attachments";
-import type { CompressedFormat, ImageCompression } from "./images";
+import type { ConvertFormat, ImageDefaults } from "./images";
 import type { HighlightStyle, NoteLinkStyle } from "./syntax";
 import type StaticSitePublisherPlugin from "./main";
 import { TextSuggest } from "./suggest";
@@ -64,15 +64,15 @@ export interface StaticSitePublisherSettings {
 	groupAttachmentsByPost: boolean;
 	attachmentUrlPrefix: string;
 	imageSizeStyle: ImageSizeStyle;
-	/** Shrink images over the size limit before uploading them. */
-	compressImages: boolean;
-	/** Images larger than this many kilobytes are compressed. */
-	compressAboveKb: number;
-	/** Longest edge, in pixels, a compressed image is scaled down to. 0 keeps its size. */
-	maxImageDimension: number;
-	/** Encoder quality for compressed images, from 1 to 100. */
+	/** Convert still images to a web format before uploading them. Each can be changed in the review window. */
+	convertImages: boolean;
+	imageFormat: ConvertFormat;
+	/** Encoder quality for converted images, from 1 to 100. */
 	imageQuality: number;
-	compressedFormat: CompressedFormat;
+	/** An image already in the chosen format and no bigger than this many kilobytes is left as it is. */
+	keepImagesUnderKb: number;
+	/** Longest edge, in pixels, a converted image is scaled down to. 0 keeps its size. */
+	maxImageDimension: number;
 
 	/**
 	 * The filename each note was last published under, by vault path, so a
@@ -106,23 +106,23 @@ export const DEFAULT_SETTINGS: StaticSitePublisherSettings = {
 	groupAttachmentsByPost: true,
 	attachmentUrlPrefix: "/posts/attachments",
 	imageSizeStyle: "html",
-	compressImages: true,
-	compressAboveKb: 500,
-	maxImageDimension: 2000,
+	convertImages: true,
+	imageFormat: "jpeg",
 	imageQuality: 80,
-	compressedFormat: "keep",
+	keepImagesUnderKb: 500,
+	maxImageDimension: 2000,
 
 	publishedFileNames: {},
 };
 
-/** The compression settings in the form the image module takes them. */
-export function imageCompression(settings: StaticSitePublisherSettings): ImageCompression {
+/** The image settings in the form the image module takes them. */
+export function imageDefaults(settings: StaticSitePublisherSettings): ImageDefaults {
 	return {
-		enabled: settings.compressImages,
-		thresholdBytes: settings.compressAboveKb * 1024,
+		convert: settings.convertImages,
+		format: settings.imageFormat === "webp" ? "webp" : "jpeg",
+		quality: Math.min(Math.max(Math.round(settings.imageQuality), 1), 100),
+		keepUnderBytes: settings.keepImagesUnderKb * 1024,
 		maxDimension: settings.maxImageDimension,
-		quality: Math.min(Math.max(settings.imageQuality, 1), 100) / 100,
-		format: settings.compressedFormat,
 	};
 }
 
@@ -690,36 +690,36 @@ export class StaticSitePublisherSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Compress large images")
+			.setName("Convert images")
 			.setDesc(
-				"Scale down and re-encode images over the size limit before uploading them, so photos straight from a phone camera do not weigh several megabytes. The image in the vault is never changed."
+				"Convert still images to a web format before uploading them, scaled down and compressed, so photos straight from a phone camera do not weigh several megabytes. GIFs and SVGs are always uploaded as they are, so animations keep moving. Each image's format and quality can still be changed in the review window, and the image in the vault is never changed."
 			)
 			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.compressImages).onChange(async (value) => {
-					this.plugin.settings.compressImages = value;
+				toggle.setValue(this.plugin.settings.convertImages).onChange(async (value) => {
+					this.plugin.settings.convertImages = value;
 					await this.save();
 				})
 			);
 
-		this.renderNumber(containerEl, {
-			name: "Compress images over (KB)",
-			desc: "Images at or below this size are uploaded exactly as they are.",
-			placeholder: "500",
-			get: () => this.plugin.settings.compressAboveKb,
-			set: (value) => (this.plugin.settings.compressAboveKb = value),
-		});
-
-		this.renderNumber(containerEl, {
-			name: "Maximum width or height (px)",
-			desc: "A compressed image is scaled down until its longest edge fits. 0 keeps its full size and only re-encodes it.",
-			placeholder: "2000",
-			get: () => this.plugin.settings.maxImageDimension,
-			set: (value) => (this.plugin.settings.maxImageDimension = value),
-		});
+		new Setting(containerEl)
+			.setName("Image format")
+			.setDesc(
+				"What images are converted to. JPEG works on every device; WebP is smaller and keeps transparency, but some devices, Safari on older iPhones among them, cannot write it and fall back to JPEG."
+			)
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("jpeg", "JPEG")
+					.addOption("webp", "WebP")
+					.setValue(this.plugin.settings.imageFormat)
+					.onChange(async (value) => {
+						this.plugin.settings.imageFormat = value as ConvertFormat;
+						await this.save();
+					})
+			);
 
 		new Setting(containerEl)
 			.setName("Image quality")
-			.setDesc("Quality of compressed JPEG and WebP images. Lower is smaller. PNGs are lossless and only scaled down.")
+			.setDesc("The quality images start out with in the review window. Lower is smaller.")
 			.addSlider((slider) =>
 				slider
 					.setLimits(10, 100, 5)
@@ -731,22 +731,21 @@ export class StaticSitePublisherSettingTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl)
-			.setName("Compressed format")
-			.setDesc(
-				"What a compressed image is saved as. Converting changes its extension, so the uploaded name changes with it. WebP falls back to JPEG on devices that cannot write it."
-			)
-			.addDropdown((dropdown) =>
-				dropdown
-					.addOption("keep", "Keep the original format")
-					.addOption("jpeg", "JPEG")
-					.addOption("webp", "WebP")
-					.setValue(this.plugin.settings.compressedFormat)
-					.onChange(async (value) => {
-						this.plugin.settings.compressedFormat = value as CompressedFormat;
-						await this.save();
-					})
-			);
+		this.renderNumber(containerEl, {
+			name: "Maximum width or height (px)",
+			desc: "A converted image is scaled down until its longest edge fits. 0 keeps its full size.",
+			placeholder: "2000",
+			get: () => this.plugin.settings.maxImageDimension,
+			set: (value) => (this.plugin.settings.maxImageDimension = value),
+		});
+
+		this.renderNumber(containerEl, {
+			name: "Leave small images alone (KB)",
+			desc: "An image already in the chosen format and no bigger than this is uploaded as it is, rather than re-encoded and losing a little quality for nothing.",
+			placeholder: "500",
+			get: () => this.plugin.settings.keepImagesUnderKb,
+			set: (value) => (this.plugin.settings.keepImagesUnderKb = value),
+		});
 	}
 
 	/** A whole-number setting; anything that is not one is ignored until it is. */

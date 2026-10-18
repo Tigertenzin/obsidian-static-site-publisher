@@ -139,18 +139,32 @@ publishing an `<img src="…" alt="…" width="450">` tag, which any markdown re
 through; set *Image sizes* to `Drop` for plain `![alt](url)` markdown instead. Embeds with no
 size are always plain markdown.
 
-**Large images are compressed.** A photo straight from a phone camera can weigh several
-megabytes. Any JPEG, PNG or WebP over *Compress images over* (500 KB by default) is scaled
-down so its longest edge fits *Maximum width or height* (2000 px), re-encoded at *Image
-quality*, and uploaded in that form; the image in the vault is never changed. A typical
-4032 × 3024 iPhone photo of 3–5 MB comes out at a few hundred kilobytes. The review window
-marks each image that will be compressed, and the preview shows its size before and after.
-By default an image keeps its format, so its name does not change; set *Compressed format*
-to JPEG or WebP to convert instead, which gives the uploaded file the new extension. GIFs
-(which would lose their animation) and SVGs are never touched, and a re-encoding that comes
-out no smaller than the original is dropped for the original. Compression happens on the
-device you publish from, so an image published from two different devices may be re-uploaded
-as *changed* even though the vault copy is the same.
+**Images are converted to a web format.** A photo straight from a phone camera can weigh several
+megabytes, and a pasted screenshot is a heavy PNG. Still images (JPEG, PNG, WebP, BMP, AVIF) are
+converted to JPEG by default, or WebP if you prefer, scaled down so the longest edge fits
+*Maximum width or height* (2000 px), and uploaded in that form. A typical 4032 × 3024 iPhone
+photo of 3–5 MB comes out at around 150 KB. The image in the vault is never changed. GIFs are
+always uploaded as they are so they stay animated, and so are SVGs.
+
+The review window shows every image with a thumbnail of exactly what will be uploaded, its
+dimensions and size before and after, and two controls of its own:
+
+- **Format**: JPEG, WebP, or the original file, untouched. Changing it renames the upload to
+  the new extension.
+- **Quality**: how hard it is compressed. The preview and the size update as you drag.
+
+The settings pick what each image starts with, and the window corrects that starting point
+once it has seen the image: a picture with see-through areas switches to WebP, since JPEG would
+fill them with white, and one that converting would only make larger is kept as it is. It says
+so when it does. A choice you make yourself is never overridden. An image already in the chosen
+format and no bigger than *Leave small images alone* (500 KB) starts out untouched, since
+re-encoding it would only lose quality. The preview lists each converted image's size before
+and after.
+
+Conversion happens on the device you publish from, so an image published from two different
+devices may be re-uploaded as *changed* even though the vault copy is the same. Some devices,
+Safari on older iPhones among them, cannot write WebP; there it is offered greyed out, and a
+WebP default falls back to JPEG.
 
 **Video, audio and PDFs.** Markdown image syntax only shows images, so other embeds are
 written in the form that works for them: video as `<video src="…" controls>` (keeping its
@@ -368,11 +382,11 @@ comment syntax and stays invisible in reading view.
 | Group images by post | Put each post's images in their own subfolder, named after the post. On by default; off puts every image straight into the attachment folder. |
 | Attachment URL prefix | What the rewritten embeds point at — usually the attachment folder with a leading slash, since the site serves it from the root. |
 | Image sizes | Keep an Obsidian size as an `<img width>` tag, or drop it for plain markdown. |
-| Compress large images | Scale down and re-encode images over the size limit before uploading. On by default. |
-| Compress images over (KB) | The size limit. Images at or below it are uploaded exactly as they are. Defaults to 500. |
-| Maximum width or height (px) | The longest edge a compressed image is scaled down to. 0 keeps its size and only re-encodes it. Defaults to 2000. |
-| Image quality | JPEG and WebP quality for compressed images, 10–100. Defaults to 80. PNGs are lossless and only scaled down. |
-| Compressed format | Keep each image's own format, or convert compressed images to JPEG or WebP. WebP falls back to JPEG on devices that cannot write it. |
+| Convert images | Convert still images to JPEG or WebP, scaled down and compressed, before uploading. On by default. Each image can still be changed in the review window. |
+| Image format | What images are converted to: JPEG (the default, works everywhere) or WebP (smaller, keeps transparency). |
+| Image quality | The quality images start with in the review window, 10–100. Defaults to 80. |
+| Maximum width or height (px) | The longest edge a converted image is scaled down to. 0 keeps its full size. Defaults to 2000. |
+| Leave small images alone (KB) | An image already in the chosen format and no bigger than this starts out untouched. Defaults to 500. |
 
 ## Building
 

@@ -1,63 +1,79 @@
 import { describe, expect, it } from "vitest";
-import { compressionTarget, scaledSize, withImageExtension, type ImageCompression } from "../src/images";
+import {
+	defaultImageFormat,
+	isConvertible,
+	replaceExtension,
+	scaledSize,
+	uploadExtension,
+	type ImageDefaults,
+} from "../src/images";
 
-const options: ImageCompression = {
-	enabled: true,
-	thresholdBytes: 500 * 1024,
+const defaults: ImageDefaults = {
+	convert: true,
+	format: "jpeg",
+	quality: 80,
+	keepUnderBytes: 500 * 1024,
 	maxDimension: 2000,
-	quality: 0.8,
-	format: "keep",
 };
 const large = 4 * 1024 * 1024;
+const small = 100 * 1024;
 const everything = () => true;
 const noWebp = (mime: string) => mime !== "image/webp";
 
-describe("compressionTarget", () => {
-	it("leaves images at or under the limit alone", () => {
-		expect(compressionTarget("photo.jpg", 500 * 1024, options, everything)).toBeNull();
-		expect(compressionTarget("photo.jpg", 500 * 1024 + 1, options, everything)).toBe("image/jpeg");
-	});
-
-	it("does nothing when turned off", () => {
-		expect(compressionTarget("photo.jpg", large, { ...options, enabled: false }, everything)).toBeNull();
-	});
-
-	it("keeps the original format by default", () => {
-		expect(compressionTarget("IMG_0001.JPEG", large, options, everything)).toBe("image/jpeg");
-		expect(compressionTarget("shot.png", large, options, everything)).toBe("image/png");
-		expect(compressionTarget("pic.webp", large, options, everything)).toBe("image/webp");
-	});
-
-	it("skips what cannot be written back in its own format", () => {
-		expect(compressionTarget("old.bmp", large, options, everything)).toBeNull();
-		expect(compressionTarget("pic.webp", large, options, noWebp)).toBeNull();
-	});
-
-	it("never touches animations, vectors or non-images", () => {
-		for (const name of ["anim.gif", "logo.svg", "favicon.ico", "clip.mp4", "paper.pdf"]) {
-			expect(compressionTarget(name, large, { ...options, format: "jpeg" }, everything)).toBeNull();
+describe("isConvertible", () => {
+	it("takes still images only", () => {
+		for (const name of ["a.jpg", "a.JPEG", "a.png", "a.webp", "a.bmp", "a.avif"]) {
+			expect(isConvertible(name)).toBe(true);
 		}
-	});
-
-	it("converts to the chosen format", () => {
-		expect(compressionTarget("shot.png", large, { ...options, format: "jpeg" }, everything)).toBe("image/jpeg");
-		expect(compressionTarget("old.bmp", large, { ...options, format: "webp" }, everything)).toBe("image/webp");
-	});
-
-	it("falls back to JPEG where WebP cannot be written", () => {
-		expect(compressionTarget("shot.png", large, { ...options, format: "webp" }, noWebp)).toBe("image/jpeg");
+		for (const name of ["anim.gif", "logo.svg", "favicon.ico", "clip.mp4", "paper.pdf", "noextension"]) {
+			expect(isConvertible(name)).toBe(false);
+		}
 	});
 });
 
-describe("withImageExtension", () => {
-	it("swaps the extension for the new format", () => {
-		expect(withImageExtension("Pasted image.png", "image/webp")).toBe("Pasted image.webp");
-		expect(withImageExtension("shot.PNG", "image/jpeg")).toBe("shot.jpg");
+describe("defaultImageFormat", () => {
+	it("converts still images to the chosen format, whatever their size", () => {
+		expect(defaultImageFormat("shot.png", small, defaults, everything)).toBe("jpeg");
+		expect(defaultImageFormat("IMG_0001.jpg", large, defaults, everything)).toBe("jpeg");
+		expect(defaultImageFormat("shot.png", small, { ...defaults, format: "webp" }, everything)).toBe("webp");
 	});
 
-	it("keeps the name when the format is unchanged or nothing is compressed", () => {
-		expect(withImageExtension("IMG_0001.jpeg", "image/jpeg")).toBe("IMG_0001.jpeg");
-		expect(withImageExtension("photo.png", null)).toBe("photo.png");
+	it("leaves a small image alone when it is already in the chosen format", () => {
+		expect(defaultImageFormat("photo.jpg", 500 * 1024, defaults, everything)).toBe("original");
+		expect(defaultImageFormat("photo.jpg", 500 * 1024 + 1, defaults, everything)).toBe("jpeg");
+		expect(defaultImageFormat("pic.webp", small, { ...defaults, format: "webp" }, everything)).toBe("original");
+	});
+
+	it("never converts GIFs, so they stay animated", () => {
+		expect(defaultImageFormat("anim.gif", large, defaults, everything)).toBe("original");
+	});
+
+	it("does nothing when turned off", () => {
+		expect(defaultImageFormat("shot.png", large, { ...defaults, convert: false }, everything)).toBe("original");
+	});
+
+	it("falls back to JPEG where WebP cannot be written", () => {
+		expect(defaultImageFormat("shot.png", large, { ...defaults, format: "webp" }, noWebp)).toBe("jpeg");
+	});
+});
+
+describe("uploadExtension", () => {
+	it("follows the format", () => {
+		expect(uploadExtension("Shot.PNG", "jpeg")).toBe(".jpg");
+		expect(uploadExtension("Shot.PNG", "webp")).toBe(".webp");
+		expect(uploadExtension("Shot.PNG", "original")).toBe(".png");
+	});
+
+	it("keeps .jpeg rather than renaming it for nothing", () => {
+		expect(uploadExtension("IMG_0001.jpeg", "jpeg")).toBe(".jpeg");
+	});
+});
+
+describe("replaceExtension", () => {
+	it("swaps the extension", () => {
+		expect(replaceExtension("pasted-image.png", ".webp")).toBe("pasted-image.webp");
+		expect(replaceExtension("v1.2-diagram.png", ".jpg")).toBe("v1.2-diagram.jpg");
+		expect(replaceExtension("noextension", ".jpg")).toBe("noextension.jpg");
 	});
 });
 

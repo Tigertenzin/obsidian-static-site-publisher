@@ -6,12 +6,22 @@ import {
 	Modal,
 	Notice,
 	Setting,
+	SliderComponent,
 	TextAreaComponent,
 	TextComponent,
 	ToggleComponent,
 	stringifyYaml,
 } from "obsidian";
 import { attachmentUrl, cleanAttachmentName, mediaKind, type Embed, type MediaKind } from "./attachments";
+import {
+	canEncode,
+	replaceExtension,
+	uploadExtension,
+	type ImageChoice,
+	type ImageFormat,
+	type ImageProcessor,
+	type ProcessedImage,
+} from "./images";
 import { diffLines, type DiffLine, type DiffResult } from "./diff";
 import { TextSuggest } from "./suggest";
 import type { NoteLink } from "./syntax";
@@ -31,6 +41,15 @@ import {
 
 /** Above this, an image is worth flagging before it is committed. */
 const LARGE_ATTACHMENT = 5 * 1024 * 1024;
+
+/** How long the quality slider has to rest before the image is converted again. */
+const RECONVERT_DELAY = 250;
+
+/** What each format is called, and why one might pick it. */
+const FORMAT_LABELS: Record<Exclude<ImageFormat, "original">, string> = {
+	jpeg: "JPEG",
+	webp: "WebP",
+};
 
 /** What the alt text field means for each kind of embed, since only images have alt text. */
 const ALT_FIELDS: Record<MediaKind, { label: string; placeholder: string }> = {
@@ -58,10 +77,12 @@ export interface Attachment {
 	/** Size of the vault file in bytes, 0 when it could not be found. */
 	size: number;
 	missing: boolean;
-	/** The vault file's name, with the extension of the format it is uploaded in. */
-	uploadName: string;
-	/** The type the image is compressed to before uploading, or null when it is sent as it is. */
-	compressTo: string | null;
+	/**
+	 * How a still image is converted before uploading, shared by every embed of
+	 * the same file and edited in place. Null for anything that is only ever
+	 * uploaded as it is: GIFs, SVGs, video, audio and PDFs.
+	 */
+	image: ImageChoice | null;
 }
 
 /** Whether an attachment is already in the repository as it stands in the vault. */
@@ -73,7 +94,7 @@ export interface PlannedUpload {
 	path: string;
 	fileName: string;
 	bytes: ArrayBuffer;
-	/** Size of the vault file, which differs from the bytes when the image was compressed. */
+	/** Size of the vault file, which differs from the bytes when the image was converted. */
 	originalSize: number;
 	/** SHA of what is at the path now, or null when nothing is. */
 	remoteSha: string | null;
@@ -113,6 +134,8 @@ export interface ReviewContext {
 	/** Images embedded in the published portion of the note. Edited in place. */
 	attachments: Attachment[];
 	attachmentUrlPrefix: string;
+	/** Converts images, shared by the review window's previews and the upload. */
+	images: ImageProcessor;
 	breakResult: BreakResult;
 	/** The body to publish: cut at the break, with comments already removed when asked. */
 	body: string;
@@ -141,6 +164,8 @@ export class ReviewModal extends Modal {
 	private suggests: TextSuggest[] = [];
 	/** Redraws each image's published URL, which moves when the post is renamed. */
 	private urlRenderers: Array<() => void> = [];
+	/** Image thumbnails, released when the window closes. */
+	private objectUrls: string[] = [];
 
 	constructor(
 		app: App,
@@ -340,13 +365,8 @@ export class ReviewModal extends Modal {
 
 			if (attachment.missing) continue;
 
-			if (attachment.compressTo !== null) {
-				const format = attachment.compressTo.replace("image/", "").toUpperCase();
-				row.createDiv({
-					cls: "ssp-hint",
-					text: `Over the compression limit: it will be scaled down and saved as ${format} before uploading. The image in the vault is not changed.`,
-				});
-			} else if (attachment.size > LARGE_ATTACHMENT) {
+			// Images report their size once converted; anything else is sent as it is.
+			if (mediaKind(attachment.embed.linkpath) !== "image" && attachment.size > LARGE_ATTACHMENT) {
 				row.createDiv({
 					cls: "ssp-warning",
 					text: `${formatBytes(
@@ -385,13 +405,21 @@ export class ReviewModal extends Modal {
 
 			if (siblings.length > 1) {
 				head.createSpan({ cls: "ssp-origin", text: "same image as above" });
+			} else if (mediaKind(attachment.embed.linkpath) === "image") {
+				// Shown once per file: every embed of it shares the one upload.
+				this.renderImageProcessing(head, attachment, siblings);
 			}
 
-			const originalName = attachment.uploadName;
+			const sourceName = attachment.file?.name ?? "";
+			// The extension follows the format the image is uploaded in, whatever was typed.
+			const extensionName = () =>
+				attachment.image
+					? replaceExtension(sourceName, uploadExtension(sourceName, attachment.image.format))
+					: sourceName;
 			name.setValue(attachment.fileName).onChange((value) => {
 				// The URL shows the cleaned name as it is typed; the field itself is
 				// only tidied on blur, so the cursor is not yanked mid-word.
-				const cleaned = cleanAttachmentName(value, originalName);
+				const cleaned = cleanAttachmentName(value, extensionName());
 				for (const sibling of siblings) {
 					sibling.attachment.fileName = cleaned;
 					if (sibling.input !== name) sibling.input.setValue(cleaned);
@@ -400,6 +428,212 @@ export class ReviewModal extends Modal {
 			});
 			name.inputEl.addEventListener("blur", () => name.setValue(attachment.fileName));
 			showUrl();
+		}
+	}
+
+	/**
+	 * What an image is uploaded as: a thumbnail of the result as it will be
+	 * committed, its format and quality, and its size before and after. Changing
+	 * either converts it again on the spot, so what is shown is what is sent.
+	 */
+	private renderImageProcessing(
+		head: HTMLElement,
+		attachment: Attachment,
+		siblings: Array<{ attachment: Attachment; input: TextComponent; showUrl: () => void }>
+	): void {
+		const file = attachment.file;
+		if (!file) return;
+
+		// Straight under the file's own line, above its name and alt text.
+		const body = createDiv({ cls: "ssp-image" });
+		head.after(body);
+		const thumb = body.createDiv({ cls: "ssp-image-thumb" });
+		const panel = body.createDiv({ cls: "ssp-image-panel" });
+		const result = panel.createDiv({ cls: "ssp-image-result", text: "Reading image…" });
+		const notes = panel.createDiv();
+
+		const choice = attachment.image;
+		let setFormat: (format: ImageFormat) => void = () => undefined;
+		// Why the window changed the format the settings picked, while it stands.
+		let adjusted: string | null = null;
+		let slider: SliderComponent | null = null;
+		let qualityValue: HTMLElement | null = null;
+
+		if (choice === null) {
+			const type = file.name.toLowerCase().endsWith(".gif") ? "GIF" : "This image";
+			panel.createDiv({
+				cls: "ssp-hint",
+				text:
+					type === "GIF"
+						? "GIF: uploaded as it is, so it stays animated."
+						: `${type} is uploaded as it is; only still photos and screenshots are converted.`,
+			});
+		} else {
+			const formatRow = panel.createDiv({ cls: "ssp-attachment-field" });
+			formatRow.createSpan({ cls: "ssp-label", text: "Format" });
+			const own = uploadExtension(file.name, "original").slice(1).toUpperCase();
+			const dropdown = new DropdownComponent(formatRow)
+				.addOption("jpeg", FORMAT_LABELS.jpeg)
+				.addOption("webp", canEncode("image/webp") ? FORMAT_LABELS.webp : `${FORMAT_LABELS.webp} (not on this device)`)
+				.addOption("original", `Original ${own}`)
+				.setValue(choice.format);
+			const webp = dropdown.selectEl.querySelector<HTMLOptionElement>('option[value="webp"]');
+			if (webp && !canEncode("image/webp")) webp.disabled = true;
+
+			const qualityRow = panel.createDiv({ cls: "ssp-attachment-field" });
+			qualityRow.createSpan({ cls: "ssp-label", text: "Quality" });
+			slider = new SliderComponent(qualityRow).setLimits(10, 100, 5).setValue(choice.quality);
+			slider.sliderEl.addClass("ssp-image-quality");
+			qualityValue = qualityRow.createSpan({ cls: "ssp-origin" });
+
+			setFormat = (format: ImageFormat) => {
+				choice.format = format;
+				dropdown.setValue(format);
+				// Every embed of the file is renamed to the new extension together.
+				const extension = uploadExtension(file.name, format);
+				for (const sibling of siblings) {
+					sibling.attachment.fileName = replaceExtension(sibling.attachment.fileName, extension);
+					sibling.input.setValue(sibling.attachment.fileName);
+					sibling.showUrl();
+				}
+				update();
+			};
+			dropdown.onChange((value) => {
+				choice.automatic = false;
+				adjusted = null;
+				setFormat(value as ImageFormat);
+			});
+
+			let timer: number | null = null;
+			slider.onChange((value) => {
+				choice.automatic = false;
+				adjusted = null;
+				choice.quality = value;
+				showQuality();
+				if (timer !== null) window.clearTimeout(timer);
+				timer = window.setTimeout(() => {
+					timer = null;
+					update();
+				}, RECONVERT_DELAY);
+			});
+		}
+
+		const showQuality = () => {
+			if (!choice || !slider || !qualityValue) return;
+			const untouched = choice.format === "original";
+			slider.setDisabled(untouched);
+			qualityValue.setText(untouched ? "—" : `${choice.quality}`);
+		};
+
+		// A slow conversion must not overwrite the result of a later one.
+		let seq = 0;
+		let shownUrl: string | null = null;
+		const update = () => {
+			showQuality();
+			const mine = ++seq;
+			result.addClass("ssp-checking");
+			result.setText(choice && choice.format !== "original" ? "Converting…" : "Reading image…");
+
+			this.context.images
+				.process(file, choice ?? { format: "original", quality: 100, automatic: false })
+				.then((processed) => {
+					if (mine !== seq || !result.isConnected) return;
+
+					const better = choice?.automatic ? this.betterFormat(choice, processed, attachment.size) : null;
+					if (better) {
+						adjusted = better.reason;
+						setFormat(better.format);
+						return;
+					}
+					result.removeClass("ssp-checking");
+
+					if (shownUrl) URL.revokeObjectURL(shownUrl);
+					shownUrl = URL.createObjectURL(new Blob([processed.bytes], { type: processed.type }));
+					this.objectUrls.push(shownUrl);
+					thumb.empty();
+					thumb.createEl("img", { attr: { src: shownUrl, alt: "" } });
+
+					this.renderImageResult(result, notes, processed, attachment.size, choice);
+					if (adjusted) notes.createDiv({ cls: "ssp-hint ssp-image-adjusted", text: adjusted });
+				})
+				.catch((error: Error) => {
+					if (mine !== seq || !result.isConnected) return;
+					result.removeClass("ssp-checking");
+					result.setText("");
+					notes.empty();
+					notes.createDiv({ cls: "ssp-warning", text: `Could not convert this image: ${error.message}` });
+				});
+		};
+		update();
+	}
+
+	/**
+	 * A better format than the one the settings picked, once the image has been
+	 * seen, or null when the pick stands. Each step moves toward the original,
+	 * so correcting one choice can never lead back to it.
+	 */
+	private betterFormat(
+		choice: ImageChoice,
+		processed: ProcessedImage,
+		originalSize: number
+	): { format: ImageFormat; reason: string } | null {
+		if (choice.format === "original") return null;
+
+		if (processed.hasAlpha && choice.format === "jpeg") {
+			return canEncode("image/webp")
+				? { format: "webp", reason: "Switched to WebP: this image has see-through areas, which JPEG would fill with white." }
+				: { format: "original", reason: "Kept as it is: this image has see-through areas, which JPEG would fill with white." };
+		}
+		if (processed.bytes.byteLength >= originalSize) {
+			return { format: "original", reason: "Kept as it is: converting would make it larger." };
+		}
+		return null;
+	}
+
+	/** The size of an image before and after, and anything about the result worth knowing. */
+	private renderImageResult(
+		result: HTMLElement,
+		notes: HTMLElement,
+		processed: ProcessedImage,
+		originalSize: number,
+		choice: ImageChoice | null
+	): void {
+		const before = `${processed.originalWidth} × ${processed.originalHeight} · ${formatBytes(originalSize)}`;
+		result.empty();
+		notes.empty();
+
+		const size = processed.bytes.byteLength;
+		if (!choice) {
+			result.setText(before);
+		} else if (choice.format === "original") {
+			result.setText(`${before}, uploaded as it is`);
+		} else {
+			const change = Math.round((1 - size / originalSize) * 100);
+			result.appendText(`${before} → `);
+			result.createEl("strong", { text: `${processed.width} × ${processed.height} · ${formatBytes(size)}` });
+			result.createSpan({
+				cls: change > 0 ? "ssp-image-saving" : "ssp-image-growth",
+				text: change > 0 ? ` ${change}% smaller` : ` ${-change}% larger`,
+			});
+		}
+
+		if (choice && processed.hasAlpha && choice.format === "jpeg") {
+			notes.createDiv({
+				cls: "ssp-warning",
+				text: "This image has see-through areas. JPEG cannot keep them, so they will be filled with white; WebP or the original keeps them.",
+			});
+		}
+		if (size > LARGE_ATTACHMENT) {
+			notes.createDiv({
+				cls: "ssp-warning",
+				text: `${formatBytes(size)} is large for a web page, and GitHub may refuse to commit it. ${
+					!choice
+						? "Consider shrinking it in the vault first."
+						: choice.format === "original"
+							? "Convert it to JPEG or WebP to shrink it."
+							: "Lower the quality to shrink it."
+				}`,
+			});
 		}
 	}
 
@@ -716,6 +950,8 @@ export class ReviewModal extends Modal {
 		if (this.lookupTimer !== null) window.clearTimeout(this.lookupTimer);
 		for (const suggest of this.suggests) suggest.destroy();
 		this.suggests.length = 0;
+		for (const url of this.objectUrls) URL.revokeObjectURL(url);
+		this.objectUrls.length = 0;
 		this.contentEl.empty();
 	}
 }
@@ -864,7 +1100,7 @@ export class PreviewModal extends Modal {
 			if (upload.bytes.byteLength !== upload.originalSize) {
 				item.createSpan({
 					cls: "ssp-origin",
-					text: `compressed ${formatBytes(upload.originalSize)} → ${formatBytes(upload.bytes.byteLength)}`,
+					text: `converted ${formatBytes(upload.originalSize)} → ${formatBytes(upload.bytes.byteLength)}`,
 				});
 				item.appendText(" ");
 			}
