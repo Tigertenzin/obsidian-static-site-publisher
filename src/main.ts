@@ -271,6 +271,10 @@ export default class StaticSitePublisherPlugin extends Plugin {
 			attachments,
 			attachmentUrlPrefix: this.settings.attachmentUrlPrefix,
 			images: new ImageProcessor((path) => this.readVaultBinary(path), this.settings.maxImageDimension),
+			imageUrl: (path) => {
+				const target = this.app.vault.getFileByPath(path);
+				return target ? this.app.vault.getResourcePath(target) : "";
+			},
 			breakResult,
 			body,
 			noteLinks: this.settings.noteLinkStyle === "text" ? findNoteLinks(body) : [],
@@ -387,11 +391,16 @@ export default class StaticSitePublisherPlugin extends Plugin {
 		const plan: PlannedUpload[] = [];
 		for (const [path, attachment] of unique) {
 			const file = attachment.file as TFile;
-			const original = await context.images.original(file.path);
+			// Converted by now, in the review window; an original is read only when it is the upload.
+			const image = attachment.image;
 			const bytes =
-				attachment.image && attachment.image.format !== "original"
-					? (await context.images.process(file, attachment.image)).bytes
-					: original;
+				image && image.format !== "original"
+					? (
+							await context.images.process(file, image).catch((error: Error) => {
+								throw new Error(`${file.name} could not be converted: ${error.message}`);
+							})
+						).bytes
+					: await this.app.vault.readBinary(file);
 			const existing = await remoteSha(path);
 			// Without a local hash there is no telling, so it is sent as changed.
 			const local = await gitBlobSha(bytes);
@@ -400,7 +409,7 @@ export default class StaticSitePublisherPlugin extends Plugin {
 				path,
 				fileName: attachment.fileName,
 				bytes,
-				originalSize: original.byteLength,
+				originalSize: attachment.size,
 				remoteSha: existing,
 				status: existing === null ? "new" : existing === local ? "unchanged" : "changed",
 			});

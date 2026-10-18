@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+	ImageProcessor,
+	SupersededError,
 	defaultImageFormat,
 	isConvertible,
 	replaceExtension,
 	scaledSize,
 	uploadExtension,
+	type ImageChoice,
 	type ImageDefaults,
+	type ProcessedImage,
 } from "../src/images";
 
 const defaults: ImageDefaults = {
@@ -86,5 +90,74 @@ describe("scaledSize", () => {
 	it("never enlarges, and 0 means no limit", () => {
 		expect(scaledSize(800, 600, 2000)).toEqual({ width: 800, height: 600 });
 		expect(scaledSize(4032, 3024, 0)).toEqual({ width: 4032, height: 3024 });
+	});
+});
+
+describe("ImageProcessor", () => {
+	const photo = (path: string) => ({ path, name: path });
+	const jpeg = (quality = 80): ImageChoice => ({ format: "jpeg", quality, automatic: true });
+
+	/** A converter that records how many conversions overlap, and can be told to fail. */
+	function harness(fail = new Set<string>()) {
+		let running = 0;
+		let peak = 0;
+		const order: string[] = [];
+		const convert = async (bytes: ArrayBuffer): Promise<ProcessedImage> => {
+			running++;
+			peak = Math.max(peak, running);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			running--;
+			const name = new TextDecoder().decode(bytes);
+			order.push(name);
+			if (fail.has(name)) throw new Error("cannot draw");
+			return { bytes, type: "image/jpeg", width: 1, height: 1, originalWidth: 1, originalHeight: 1, hasAlpha: false };
+		};
+		const read = async (path: string) => new TextEncoder().encode(path).buffer as ArrayBuffer;
+		return { processor: new ImageProcessor(read, 2000, convert), peak: () => peak, order };
+	}
+
+	it("converts one image at a time, in the order asked", async () => {
+		const { processor, peak, order } = harness();
+		await Promise.all(["a.png", "b.png", "c.png"].map((path) => processor.process(photo(path), jpeg())));
+		expect(peak()).toBe(1);
+		expect(order).toEqual(["a.png", "b.png", "c.png"]);
+	});
+
+	it("reuses a finished conversion for the same choice", async () => {
+		const { processor, order } = harness();
+		const choice = jpeg();
+		await processor.process(photo("a.png"), choice);
+		expect(processor.finished(photo("a.png"), choice)).not.toBeNull();
+		await processor.process(photo("a.png"), choice);
+		expect(order).toEqual(["a.png"]);
+		expect(processor.finished(photo("a.png"), jpeg(50))).toBeNull();
+	});
+
+	it("skips a conversion overtaken by a newer choice before its turn", async () => {
+		const { processor, order } = harness();
+		const first = processor.process(photo("a.png"), jpeg());
+		const stale = processor.process(photo("b.png"), jpeg(80));
+		const latest = processor.process(photo("b.png"), jpeg(50));
+		await first;
+		await expect(stale).rejects.toBeInstanceOf(SupersededError);
+		await latest;
+		expect(order).toEqual(["a.png", "b.png"]);
+	});
+
+	it("does not remember a failure, so trying again tries again", async () => {
+		const fail = new Set(["a.png"]);
+		const { processor, order } = harness(fail);
+		await expect(processor.process(photo("a.png"), jpeg())).rejects.toThrow("cannot draw");
+		fail.clear();
+		await expect(processor.process(photo("a.png"), jpeg())).resolves.toBeTruthy();
+		expect(order).toEqual(["a.png", "a.png"]);
+	});
+
+	it("keeps going after a failure", async () => {
+		const { processor } = harness(new Set(["a.png"]));
+		const failed = processor.process(photo("a.png"), jpeg());
+		const next = processor.process(photo("b.png"), jpeg());
+		await expect(failed).rejects.toThrow();
+		await expect(next).resolves.toBeTruthy();
 	});
 });

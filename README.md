@@ -146,17 +146,32 @@ converted to JPEG by default, or WebP if you prefer, scaled down so the longest 
 photo of 3–5 MB comes out at around 150 KB. The image in the vault is never changed. GIFs are
 always uploaded as they are so they stay animated, and so are SVGs.
 
-The review window shows every image with a thumbnail of exactly what will be uploaded, its
-dimensions and size before and after, and two controls of its own:
+The review window lists every image with a thumbnail of the original, its dimensions and size,
+and two controls of its own:
 
 - **Format**: JPEG, WebP, or the original file, untouched. Changing it renames the upload to
   the new extension.
-- **Quality**: how hard it is compressed. The preview and the size update as you drag.
+- **Quality**: how hard it is compressed.
 
-The settings pick what each image starts with, and the window corrects that starting point
+Nothing is converted until you ask. Press **Convert** under an image to convert just that one,
+or **Convert all images** at the foot of the window to work through them all, with a progress
+bar and a button to stop. Continuing to the preview converts whatever is still waiting first,
+so nothing is ever uploaded unconverted by mistake. A converted image shows a thumbnail of
+exactly what will be uploaded and its size before and after; change its format or quality
+afterwards and it is converted again on the spot.
+
+Images are always converted **one at a time**, and each photo's memory is let go as soon as it
+is done. A phone holds a decoded photo at around ten times its file size, and converting a
+post's photos side by side is enough for iOS to close the app; one at a time, only a single
+photo is ever held, however many the post has. The thumbnails before conversion come straight
+from Obsidian, so opening the window reads nothing into memory either.
+
+The settings pick what each image starts with, and conversion corrects that starting point
 once it has seen the image: a picture with see-through areas switches to WebP, since JPEG would
-fill them with white, and one that converting would only make larger is kept as it is. It says
-so when it does. A choice you make yourself is never overridden. An image already in the chosen
+fill them with white; one that converting would only make larger, or that this device cannot
+convert at all, is kept as it is. It says so when it does. A choice you make yourself is never
+overridden: if an image you set by hand cannot be converted, it says why and which image, and
+the preview waits until you try again or choose Original. An image already in the chosen
 format and no bigger than *Leave small images alone* (500 KB) starts out untouched, since
 re-encoding it would only lose quality. The preview lists each converted image's size before
 and after.

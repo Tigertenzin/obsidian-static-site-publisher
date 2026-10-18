@@ -147,92 +147,128 @@ export function canEncode(mime: string): boolean {
 	return known;
 }
 
-/**
- * Converts images for upload, one result kept per file, so the review window's
- * previews and the upload itself share a single conversion of each image.
- */
-export class ImageProcessor {
-	private reads = new Map<string, Promise<ArrayBuffer>>();
-	private results = new Map<string, { key: string; result: Promise<ProcessedImage> }>();
-
-	constructor(
-		private readonly read: (path: string) => Promise<ArrayBuffer>,
-		private readonly maxDimension: number
-	) {}
-
-	/** The vault file's bytes, read once. */
-	original(path: string): Promise<ArrayBuffer> {
-		let bytes = this.reads.get(path);
-		if (!bytes) {
-			bytes = this.read(path);
-			this.reads.set(path, bytes);
-		}
-		return bytes;
-	}
-
-	process(file: { path: string; name: string }, choice: ImageChoice): Promise<ProcessedImage> {
-		const key = `${choice.format}:${choice.quality}`;
-		const cached = this.results.get(file.path);
-		if (cached?.key === key) return cached.result;
-
-		const inputType = imageMimeType(file.name) ?? "application/octet-stream";
-		const outputType = choice.format === "original" ? null : formatMimeType(choice.format);
-		const result = this.original(file.path).then((bytes) =>
-			processImage(bytes, inputType, outputType, choice.quality / 100, this.maxDimension)
-		);
-		// Only the latest choice is worth keeping: dragging the quality slider
-		// would otherwise hold on to every setting it passed through.
-		this.results.set(file.path, { key, result });
-		return result;
+/** Thrown for a conversion that was overtaken by a newer choice before its turn came. */
+export class SupersededError extends Error {
+	constructor() {
+		super("superseded by a newer choice");
 	}
 }
 
 /**
- * Scales an image down to fit `maxDimension` and re-encodes it as `outputType`,
- * or, with no output type, only reads its size. The image is decoded by an
- * <img>, which honours the EXIF rotation phone cameras write, so a portrait
- * photo stays upright once that tag is gone.
+ * Converts images for upload strictly one at a time, keeping one result per
+ * file, so the review window and the upload share a single conversion of each
+ * image. A phone keeps a decoded photo in memory at several times its file
+ * size, and converting a post's photos side by side is enough for iOS to close
+ * the app; in a queue, only one is ever held at once.
+ */
+export class ImageProcessor {
+	private results = new Map<string, { key: string; result: Promise<ProcessedImage>; value: ProcessedImage | null }>();
+	private queue: Promise<unknown> = Promise.resolve();
+
+	constructor(
+		private readonly read: (path: string) => Promise<ArrayBuffer>,
+		private readonly maxDimension: number,
+		private readonly convert: typeof processImage = processImage
+	) {}
+
+	/** The finished conversion for this choice, or null when it has not been made. */
+	finished(file: { path: string }, choice: ImageChoice): ProcessedImage | null {
+		const entry = this.results.get(file.path);
+		return entry?.key === choiceKey(choice) ? entry.value : null;
+	}
+
+	process(file: { path: string; name: string }, choice: ImageChoice): Promise<ProcessedImage> {
+		if (choice.format === "original") return Promise.reject(new Error("an original image is not converted"));
+
+		const key = choiceKey(choice);
+		const cached = this.results.get(file.path);
+		if (cached?.key === key) return cached.result;
+
+		const inputType = imageMimeType(file.name) ?? "application/octet-stream";
+		const outputType = formatMimeType(choice.format);
+		const result = this.enqueue(async () => {
+			// Dragging the quality slider queues a conversion per stop; only the last is worth making.
+			if (this.results.get(file.path)?.key !== key) throw new SupersededError();
+			// Read only now, so the queue never holds more than one original either.
+			const bytes = await this.read(file.path);
+			return this.convert(bytes, inputType, outputType, choice.quality / 100, this.maxDimension);
+		});
+
+		const entry = { key, result, value: null as ProcessedImage | null };
+		this.results.set(file.path, entry);
+		result.then(
+			(value) => {
+				entry.value = value;
+			},
+			() => {
+				// A failure is not kept, so trying again really tries again.
+				if (this.results.get(file.path) === entry) this.results.delete(file.path);
+			}
+		);
+		return result;
+	}
+
+	private enqueue<T>(task: () => Promise<T>): Promise<T> {
+		const run = this.queue.then(task, task);
+		this.queue = run.catch(() => undefined);
+		return run;
+	}
+}
+
+function choiceKey(choice: ImageChoice): string {
+	return `${choice.format}:${choice.quality}`;
+}
+
+/**
+ * Scales an image down to fit `maxDimension` and re-encodes it as `outputType`.
+ * The image is decoded by an <img>, which honours the EXIF rotation phone
+ * cameras write, so a portrait photo stays upright once that tag is gone.
  */
 export async function processImage(
 	bytes: ArrayBuffer,
 	inputType: string,
-	outputType: string | null,
+	outputType: string,
 	quality: number,
 	maxDimension: number
 ): Promise<ProcessedImage> {
 	const url = URL.createObjectURL(new Blob([bytes], { type: inputType }));
+	const image = new Image();
 	try {
-		const image = new Image();
 		image.src = url;
-		await image.decode();
+		await image.decode().catch(() => {
+			throw new Error("the image could not be read; it may be damaged, or too large for this device");
+		});
 
 		const originalWidth = image.naturalWidth;
 		const originalHeight = image.naturalHeight;
-		const hasAlpha = inputType !== "image/jpeg" && CONVERTIBLE.has(inputType) && hasTransparency(image);
-
-		if (outputType === null) {
-			return { bytes, type: inputType, width: originalWidth, height: originalHeight, originalWidth, originalHeight, hasAlpha };
-		}
+		const hasAlpha = inputType !== "image/jpeg" && hasTransparency(image);
 
 		const { width, height } = scaledSize(originalWidth, originalHeight, maxDimension);
 		const canvas = drawCanvas(width, height);
-		const context = canvas.getContext("2d");
-		if (!context) throw new Error("this device cannot draw images");
+		try {
+			const context = canvas.getContext("2d");
+			if (!context) throw new Error(`a ${width} × ${height} image is too large for this device to draw`);
 
-		// JPEG has no transparency; without a fill, see-through areas turn black.
-		if (outputType === "image/jpeg") {
-			context.fillStyle = "#ffffff";
-			context.fillRect(0, 0, width, height);
+			// JPEG has no transparency; without a fill, see-through areas turn black.
+			if (outputType === "image/jpeg") {
+				context.fillStyle = "#ffffff";
+				context.fillRect(0, 0, width, height);
+			}
+			context.imageSmoothingEnabled = true;
+			context.imageSmoothingQuality = "high";
+			context.drawImage(image, 0, 0, width, height);
+
+			const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, outputType, quality));
+			if (!blob) throw new Error(`this device could not save a ${width} × ${height} image`);
+			if (blob.type !== outputType) throw new Error(`this device cannot write ${outputType.replace("image/", "").toUpperCase()}`);
+
+			return { bytes: await blob.arrayBuffer(), type: outputType, width, height, originalWidth, originalHeight, hasAlpha };
+		} finally {
+			releaseCanvas(canvas);
 		}
-		context.imageSmoothingEnabled = true;
-		context.imageSmoothingQuality = "high";
-		context.drawImage(image, 0, 0, width, height);
-
-		const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, outputType, quality));
-		if (!blob || blob.type !== outputType) throw new Error(`this device cannot write ${outputType}`);
-
-		return { bytes: await blob.arrayBuffer(), type: outputType, width, height, originalWidth, originalHeight, hasAlpha };
 	} finally {
+		// Let go of the decoded photo now, rather than whenever the browser gets round to it.
+		image.src = "";
 		URL.revokeObjectURL(url);
 	}
 }
@@ -246,10 +282,17 @@ function hasTransparency(image: HTMLImageElement): boolean {
 
 	context.drawImage(image, 0, 0, width, height);
 	const pixels = context.getImageData(0, 0, width, height).data;
+	releaseCanvas(canvas);
 	for (let i = 3; i < pixels.length; i += 4) {
 		if (pixels[i] < 255) return true;
 	}
 	return false;
+}
+
+/** Safari keeps a canvas's memory until it is shrunk, even once nothing refers to it. */
+function releaseCanvas(canvas: HTMLCanvasElement): void {
+	canvas.width = 0;
+	canvas.height = 0;
 }
 
 function drawCanvas(width: number, height: number): HTMLCanvasElement {

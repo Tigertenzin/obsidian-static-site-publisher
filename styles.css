@@ -717,3 +717,54 @@
 .ssp-image-growth {
 	color: var(--text-warning);
 }
+
+.ssp-image-actions {
+	margin-top: 0.4em;
+}
+
+.ssp-hidden {
+	display: none;
+}
+
+/* Convert all images, at the foot of the review window */
+
+.ssp-convert-all {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5em 0.8em;
+	margin: 0.8em 0;
+	padding: 0.6em 0.7em;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	background-color: var(--background-primary-alt);
+}
+
+.ssp-progress {
+	flex: 1 1 12rem;
+	min-width: 0;
+}
+
+.ssp-progress-label {
+	overflow: hidden;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.ssp-progress-track {
+	height: 6px;
+	margin-top: 0.35em;
+	overflow: hidden;
+	border-radius: 3px;
+	background-color: var(--background-modifier-border);
+}
+
+.ssp-progress-fill {
+	width: 0;
+	height: 100%;
+	border-radius: 3px;
+	background-color: var(--interactive-accent);
+	transition: width 0.2s ease;
+}

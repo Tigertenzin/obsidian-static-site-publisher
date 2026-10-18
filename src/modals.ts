@@ -19,6 +19,9 @@ import {
 	uploadExtension,
 	type ImageChoice,
 	type ImageFormat,
+	SupersededError,
+	formatMimeType,
+	imageMimeType,
 	type ImageProcessor,
 	type ProcessedImage,
 } from "./images";
@@ -45,7 +48,40 @@ const LARGE_ATTACHMENT = 5 * 1024 * 1024;
 /** How long the quality slider has to rest before the image is converted again. */
 const RECONVERT_DELAY = 250;
 
-/** What each format is called, and why one might pick it. */
+/**
+ * A better format than the one the settings picked, once the image has been
+ * seen, or null when the pick stands. Each step moves toward the original, so
+ * correcting one choice can never lead back to it.
+ */
+function betterFormat(
+	choice: ImageChoice,
+	processed: ProcessedImage,
+	originalSize: number
+): { format: ImageFormat; reason: string } | null {
+	if (choice.format === "original") return null;
+
+	if (processed.hasAlpha && choice.format === "jpeg") {
+		return canEncode("image/webp")
+			? { format: "webp", reason: "Switched to WebP: this image has see-through areas, which JPEG would fill with white." }
+			: { format: "original", reason: "Kept as it is: this image has see-through areas, which JPEG would fill with white." };
+	}
+	if (processed.bytes.byteLength >= originalSize) {
+		return { format: "original", reason: "Kept as it is: converting would make it larger." };
+	}
+	return null;
+}
+
+/** One image's conversion, as "Convert all images" and the step to the preview drive it. */
+interface ImageRow {
+	name: string;
+	/** True while the image still has to be converted before it can be uploaded. */
+	pending: () => boolean;
+	/** Why the last attempt failed, on a format chosen by hand, or null. */
+	failure: () => string | null;
+	convert: () => Promise<void>;
+}
+
+/** What each format is called. */
 const FORMAT_LABELS: Record<Exclude<ImageFormat, "original">, string> = {
 	jpeg: "JPEG",
 	webp: "WebP",
@@ -136,6 +172,8 @@ export interface ReviewContext {
 	attachmentUrlPrefix: string;
 	/** Converts images, shared by the review window's previews and the upload. */
 	images: ImageProcessor;
+	/** A URL the window can show a vault file from, without reading it into memory. */
+	imageUrl: (path: string) => string;
 	breakResult: BreakResult;
 	/** The body to publish: cut at the break, with comments already removed when asked. */
 	body: string;
@@ -166,6 +204,11 @@ export class ReviewModal extends Modal {
 	private urlRenderers: Array<() => void> = [];
 	/** Image thumbnails, released when the window closes. */
 	private objectUrls: string[] = [];
+	/** Every image that can be converted, in order. */
+	private imageRows: ImageRow[] = [];
+	/** The "Convert all images" run in progress, which its button can stop. */
+	private batch: { stop: boolean } | null = null;
+	private progress: { button: ButtonComponent; label: HTMLElement; fill: HTMLElement; track: HTMLElement } | null = null;
 
 	constructor(
 		app: App,
@@ -224,6 +267,7 @@ export class ReviewModal extends Modal {
 
 		this.renderBreakWarning(contentEl);
 		this.renderNoteLinks(contentEl);
+		this.renderConvertAll(contentEl);
 
 		new Setting(contentEl)
 			.addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
@@ -231,12 +275,13 @@ export class ReviewModal extends Modal {
 				button
 					.setButtonText("Continue to preview")
 					.setCta()
-					.onClick(() => {
+					.onClick(async () => {
 						const problem = this.validate();
 						if (problem) {
 							new Notice(problem, 6000);
 							return;
 						}
+						if (!(await this.convertRemaining())) return;
 						this.close();
 						this.onConfirm();
 					})
@@ -432,9 +477,10 @@ export class ReviewModal extends Modal {
 	}
 
 	/**
-	 * What an image is uploaded as: a thumbnail of the result as it will be
-	 * committed, its format and quality, and its size before and after. Changing
-	 * either converts it again on the spot, so what is shown is what is sent.
+	 * What an image is uploaded as: its format and quality, and once converted a
+	 * thumbnail of the result as it will be committed, with its size before and
+	 * after. Nothing is converted until asked, here or by "Convert all images",
+	 * so opening the window costs no more than showing the originals.
 	 */
 	private renderImageProcessing(
 		head: HTMLElement,
@@ -449,192 +495,324 @@ export class ReviewModal extends Modal {
 		head.after(body);
 		const thumb = body.createDiv({ cls: "ssp-image-thumb" });
 		const panel = body.createDiv({ cls: "ssp-image-panel" });
-		const result = panel.createDiv({ cls: "ssp-image-result", text: "Reading image…" });
+		const result = panel.createDiv({ cls: "ssp-image-result" });
+		const controls = panel.createDiv();
+		const actions = panel.createDiv({ cls: "ssp-image-actions" });
 		const notes = panel.createDiv();
 
 		const choice = attachment.image;
-		let setFormat: (format: ImageFormat) => void = () => undefined;
-		// Why the window changed the format the settings picked, while it stands.
-		let adjusted: string | null = null;
-		let slider: SliderComponent | null = null;
-		let qualityValue: HTMLElement | null = null;
+		let dimensions: string | null = null;
+		// Redraws the row once the thumbnail has told us the image's size.
+		let onDimensions: () => void = () => undefined;
+
+		// The original, as Obsidian itself serves it: nothing is read into memory to show it.
+		let thumbShows: string | null = null;
+		const showThumb = (src: string) => {
+			if (thumbShows === src) return;
+			thumbShows = src;
+			thumb.empty();
+			const img = thumb.createEl("img", { attr: { src, alt: "", decoding: "async" } });
+			// A file the device cannot show leaves the plain placeholder, not a broken-image icon.
+			img.addEventListener("error", () => img.remove(), { once: true });
+			if (dimensions === null) {
+				img.addEventListener(
+					"load",
+					() => {
+						dimensions = `${img.naturalWidth} × ${img.naturalHeight}`;
+						onDimensions();
+					},
+					{ once: true }
+				);
+			}
+		};
+		const before = () => `${dimensions ? `${dimensions} · ` : ""}${formatBytes(attachment.size)}`;
 
 		if (choice === null) {
-			const type = file.name.toLowerCase().endsWith(".gif") ? "GIF" : "This image";
+			const gif = file.name.toLowerCase().endsWith(".gif");
 			panel.createDiv({
 				cls: "ssp-hint",
-				text:
-					type === "GIF"
-						? "GIF: uploaded as it is, so it stays animated."
-						: `${type} is uploaded as it is; only still photos and screenshots are converted.`,
+				text: gif
+					? "GIF: uploaded as it is, so it stays animated."
+					: "Uploaded as it is; only still photos and screenshots are converted.",
 			});
-		} else {
-			const formatRow = panel.createDiv({ cls: "ssp-attachment-field" });
-			formatRow.createSpan({ cls: "ssp-label", text: "Format" });
-			const own = uploadExtension(file.name, "original").slice(1).toUpperCase();
-			const dropdown = new DropdownComponent(formatRow)
-				.addOption("jpeg", FORMAT_LABELS.jpeg)
-				.addOption("webp", canEncode("image/webp") ? FORMAT_LABELS.webp : `${FORMAT_LABELS.webp} (not on this device)`)
-				.addOption("original", `Original ${own}`)
-				.setValue(choice.format);
-			const webp = dropdown.selectEl.querySelector<HTMLOptionElement>('option[value="webp"]');
-			if (webp && !canEncode("image/webp")) webp.disabled = true;
-
-			const qualityRow = panel.createDiv({ cls: "ssp-attachment-field" });
-			qualityRow.createSpan({ cls: "ssp-label", text: "Quality" });
-			slider = new SliderComponent(qualityRow).setLimits(10, 100, 5).setValue(choice.quality);
-			slider.sliderEl.addClass("ssp-image-quality");
-			qualityValue = qualityRow.createSpan({ cls: "ssp-origin" });
-
-			setFormat = (format: ImageFormat) => {
-				choice.format = format;
-				dropdown.setValue(format);
-				// Every embed of the file is renamed to the new extension together.
-				const extension = uploadExtension(file.name, format);
-				for (const sibling of siblings) {
-					sibling.attachment.fileName = replaceExtension(sibling.attachment.fileName, extension);
-					sibling.input.setValue(sibling.attachment.fileName);
-					sibling.showUrl();
-				}
-				update();
-			};
-			dropdown.onChange((value) => {
-				choice.automatic = false;
-				adjusted = null;
-				setFormat(value as ImageFormat);
-			});
-
-			let timer: number | null = null;
-			slider.onChange((value) => {
-				choice.automatic = false;
-				adjusted = null;
-				choice.quality = value;
-				showQuality();
-				if (timer !== null) window.clearTimeout(timer);
-				timer = window.setTimeout(() => {
-					timer = null;
-					update();
-				}, RECONVERT_DELAY);
-			});
+			if (attachment.size > LARGE_ATTACHMENT) {
+				notes.createDiv({
+					cls: "ssp-warning",
+					text: `${formatBytes(attachment.size)} is large for a web page, and GitHub may refuse to commit it. Consider shrinking it in the vault first.`,
+				});
+			}
+			onDimensions = () => result.setText(before());
+			onDimensions();
+			showThumb(this.context.imageUrl(file.path));
+			return;
 		}
 
-		const showQuality = () => {
-			if (!choice || !slider || !qualityValue) return;
-			const untouched = choice.format === "original";
-			slider.setDisabled(untouched);
-			qualityValue.setText(untouched ? "—" : `${choice.quality}`);
-		};
-
+		let state: "idle" | "working" | "done" | "failed" = "idle";
+		let processed: ProcessedImage | null = null;
+		let failure: string | null = null;
+		// Why the window changed the format the settings picked, while it stands.
+		let adjusted: string | null = null;
+		// Once an image has been converted, changing it converts it again on its own.
+		let converted = false;
 		// A slow conversion must not overwrite the result of a later one.
 		let seq = 0;
 		let shownUrl: string | null = null;
-		const update = () => {
-			showQuality();
-			const mine = ++seq;
-			result.addClass("ssp-checking");
-			result.setText(choice && choice.format !== "original" ? "Converting…" : "Reading image…");
 
-			this.context.images
-				.process(file, choice ?? { format: "original", quality: 100, automatic: false })
-				.then((processed) => {
-					if (mine !== seq || !result.isConnected) return;
+		const formatRow = controls.createDiv({ cls: "ssp-attachment-field" });
+		formatRow.createSpan({ cls: "ssp-label", text: "Format" });
+		const own = uploadExtension(file.name, "original").slice(1).toUpperCase();
+		const dropdown = new DropdownComponent(formatRow)
+			.addOption("jpeg", FORMAT_LABELS.jpeg)
+			.addOption("webp", canEncode("image/webp") ? FORMAT_LABELS.webp : `${FORMAT_LABELS.webp} (not on this device)`)
+			.addOption("original", `Original ${own}`)
+			.setValue(choice.format);
+		const webp = dropdown.selectEl.querySelector<HTMLOptionElement>('option[value="webp"]');
+		if (webp && !canEncode("image/webp")) webp.disabled = true;
 
-					const better = choice?.automatic ? this.betterFormat(choice, processed, attachment.size) : null;
-					if (better) {
-						adjusted = better.reason;
-						setFormat(better.format);
-						return;
-					}
-					result.removeClass("ssp-checking");
+		const qualityRow = controls.createDiv({ cls: "ssp-attachment-field" });
+		qualityRow.createSpan({ cls: "ssp-label", text: "Quality" });
+		const slider = new SliderComponent(qualityRow).setLimits(10, 100, 5).setValue(choice.quality);
+		slider.sliderEl.addClass("ssp-image-quality");
+		const qualityValue = qualityRow.createSpan({ cls: "ssp-origin" });
 
+		const button = new ButtonComponent(actions).onClick(() => void convert());
+
+		/** Picks up a conversion already made for the current choice, as when stepping back from the preview. */
+		const settle = () => {
+			processed = this.context.images.finished(file, choice);
+			state = processed ? "done" : "idle";
+			failure = null;
+		};
+
+		const render = () => {
+			const untouched = choice.format === "original";
+			slider.setDisabled(untouched);
+			qualityValue.setText(untouched ? "—" : `${choice.quality}`);
+
+			result.empty();
+			result.toggleClass("ssp-checking", state === "working");
+			notes.empty();
+			if (adjusted) notes.createDiv({ cls: "ssp-hint ssp-image-adjusted", text: adjusted });
+
+			if (untouched) {
+				result.setText(`${before()}, uploaded as it is`);
+			} else if (state === "done" && processed) {
+				const size = processed.bytes.byteLength;
+				const change = Math.round((1 - size / attachment.size) * 100);
+				result.appendText(`${processed.originalWidth} × ${processed.originalHeight} · ${formatBytes(attachment.size)} → `);
+				result.createEl("strong", { text: `${processed.width} × ${processed.height} · ${formatBytes(size)}` });
+				result.createSpan({
+					cls: change > 0 ? "ssp-image-saving" : "ssp-image-growth",
+					text: change > 0 ? ` ${change}% smaller` : ` ${-change}% larger`,
+				});
+			} else {
+				result.setText(`${before()} · ${state === "working" ? "converting…" : "not converted yet"}`);
+			}
+
+			if (state === "failed" && failure) {
+				notes.createDiv({ cls: "ssp-warning", text: `Could not convert ${file.name}: ${failure}. Try again, or choose Original.` });
+			}
+			if (state === "done" && processed) {
+				if (processed.hasAlpha && choice.format === "jpeg") {
+					notes.createDiv({
+						cls: "ssp-warning",
+						text: "This image has see-through areas. JPEG cannot keep them, so they will be filled with white; WebP or the original keeps them.",
+					});
+				}
+				if (processed.bytes.byteLength > LARGE_ATTACHMENT) {
+					notes.createDiv({
+						cls: "ssp-warning",
+						text: `${formatBytes(processed.bytes.byteLength)} is large for a web page, and GitHub may refuse to commit it. Lower the quality to shrink it.`,
+					});
+				}
+			}
+			if (untouched && attachment.size > LARGE_ATTACHMENT) {
+				notes.createDiv({
+					cls: "ssp-warning",
+					text: `${formatBytes(attachment.size)} is large for a web page, and GitHub may refuse to commit it. Convert it to JPEG or WebP to shrink it.`,
+				});
+			}
+
+			// The button is for an image still to convert; a finished one updates by itself.
+			const sameType = imageMimeType(file.name) === formatMimeType(choice.format === "webp" ? "webp" : "jpeg");
+			actions.toggleClass("ssp-hidden", untouched || state === "done");
+			button.setDisabled(state === "working");
+			button.setButtonText(
+				state === "working"
+					? "Converting…"
+					: state === "failed"
+						? "Try again"
+						: sameType
+							? "Compress"
+							: `Convert to ${FORMAT_LABELS[choice.format === "webp" ? "webp" : "jpeg"]}`
+			);
+
+			if (state === "done" && processed && body.isConnected) {
+				if (!shownUrl || thumbShows !== shownUrl) {
 					if (shownUrl) URL.revokeObjectURL(shownUrl);
 					shownUrl = URL.createObjectURL(new Blob([processed.bytes], { type: processed.type }));
 					this.objectUrls.push(shownUrl);
-					thumb.empty();
-					thumb.createEl("img", { attr: { src: shownUrl, alt: "" } });
-
-					this.renderImageResult(result, notes, processed, attachment.size, choice);
-					if (adjusted) notes.createDiv({ cls: "ssp-hint ssp-image-adjusted", text: adjusted });
-				})
-				.catch((error: Error) => {
-					if (mine !== seq || !result.isConnected) return;
-					result.removeClass("ssp-checking");
-					result.setText("");
-					notes.empty();
-					notes.createDiv({ cls: "ssp-warning", text: `Could not convert this image: ${error.message}` });
-				});
+				}
+				showThumb(shownUrl);
+			} else {
+				showThumb(this.context.imageUrl(file.path));
+			}
 		};
-		update();
+
+		const setFormat = (format: ImageFormat) => {
+			choice.format = format;
+			dropdown.setValue(format);
+			// Every embed of the file is renamed to the new extension together.
+			const extension = uploadExtension(file.name, format);
+			for (const sibling of siblings) {
+				sibling.attachment.fileName = replaceExtension(sibling.attachment.fileName, extension);
+				sibling.input.setValue(sibling.attachment.fileName);
+				sibling.showUrl();
+			}
+			settle();
+		};
+
+		/** Converts the image, correcting a default that turns out badly. Resolves whatever happens. */
+		const convert = async (): Promise<void> => {
+			const mine = ++seq;
+			for (;;) {
+				if (choice.format === "original") {
+					render();
+					return;
+				}
+				state = "working";
+				failure = null;
+				render();
+				try {
+					const out = await this.context.images.process(file, choice);
+					if (mine !== seq) return;
+					converted = true;
+					const better = choice.automatic ? betterFormat(choice, out, attachment.size) : null;
+					if (better) {
+						adjusted = better.reason;
+						setFormat(better.format);
+						continue;
+					}
+					processed = out;
+					state = "done";
+					render();
+					return;
+				} catch (error) {
+					if (mine !== seq || error instanceof SupersededError) return;
+					const message = (error as Error).message;
+					if (choice.automatic) {
+						// The settings picked this format, not the user: fall back rather than block.
+						adjusted = `Kept as it is: it could not be converted on this device (${message}).`;
+						setFormat("original");
+						continue;
+					}
+					failure = message;
+					state = "failed";
+					render();
+					return;
+				}
+			}
+		};
+
+		/** A change made by hand: it stands, and replaces whatever the window decided. */
+		const changedByHand = () => {
+			choice.automatic = false;
+			adjusted = null;
+			seq++;
+			settle();
+			render();
+		};
+
+		dropdown.onChange((value) => {
+			setFormat(value as ImageFormat);
+			changedByHand();
+			if (converted) void convert();
+		});
+
+		let timer: number | null = null;
+		slider.onChange((value) => {
+			choice.quality = value;
+			changedByHand();
+			if (!converted) return;
+			if (timer !== null) window.clearTimeout(timer);
+			timer = window.setTimeout(() => {
+				timer = null;
+				void convert();
+			}, RECONVERT_DELAY);
+		});
+
+		settle();
+		converted = processed !== null;
+		onDimensions = render;
+		render();
+
+		this.imageRows.push({
+			name: file.name,
+			pending: () => choice.format !== "original" && state !== "done",
+			failure: () => (state === "failed" ? failure : null),
+			convert,
+		});
 	}
 
 	/**
-	 * A better format than the one the settings picked, once the image has been
-	 * seen, or null when the pick stands. Each step moves toward the original,
-	 * so correcting one choice can never lead back to it.
+	 * The button that converts every image still waiting, one at a time, with
+	 * its progress. Continuing to the preview runs it too, so nothing is ever
+	 * uploaded unconverted by mistake.
 	 */
-	private betterFormat(
-		choice: ImageChoice,
-		processed: ProcessedImage,
-		originalSize: number
-	): { format: ImageFormat; reason: string } | null {
-		if (choice.format === "original") return null;
+	private renderConvertAll(contentEl: HTMLElement): void {
+		if (this.imageRows.length === 0) return;
 
-		if (processed.hasAlpha && choice.format === "jpeg") {
-			return canEncode("image/webp")
-				? { format: "webp", reason: "Switched to WebP: this image has see-through areas, which JPEG would fill with white." }
-				: { format: "original", reason: "Kept as it is: this image has see-through areas, which JPEG would fill with white." };
-		}
-		if (processed.bytes.byteLength >= originalSize) {
-			return { format: "original", reason: "Kept as it is: converting would make it larger." };
-		}
-		return null;
+		const bar = contentEl.createDiv({ cls: "ssp-convert-all" });
+		const button = new ButtonComponent(bar).onClick(() => {
+			if (this.batch) this.batch.stop = true;
+			else void this.convertAll();
+		});
+		const progress = bar.createDiv({ cls: "ssp-progress" });
+		const label = progress.createDiv({ cls: "ssp-progress-label" });
+		const track = progress.createDiv({ cls: "ssp-progress-track" });
+		const fill = track.createDiv({ cls: "ssp-progress-fill" });
+		this.progress = { button, label, fill, track };
+		this.showProgressIdle();
 	}
 
-	/** The size of an image before and after, and anything about the result worth knowing. */
-	private renderImageResult(
-		result: HTMLElement,
-		notes: HTMLElement,
-		processed: ProcessedImage,
-		originalSize: number,
-		choice: ImageChoice | null
-	): void {
-		const before = `${processed.originalWidth} × ${processed.originalHeight} · ${formatBytes(originalSize)}`;
-		result.empty();
-		notes.empty();
+	private showProgressIdle(): void {
+		if (!this.progress) return;
+		const { button, label, fill, track } = this.progress;
+		const waiting = this.imageRows.filter((row) => row.pending()).length;
 
-		const size = processed.bytes.byteLength;
-		if (!choice) {
-			result.setText(before);
-		} else if (choice.format === "original") {
-			result.setText(`${before}, uploaded as it is`);
-		} else {
-			const change = Math.round((1 - size / originalSize) * 100);
-			result.appendText(`${before} → `);
-			result.createEl("strong", { text: `${processed.width} × ${processed.height} · ${formatBytes(size)}` });
-			result.createSpan({
-				cls: change > 0 ? "ssp-image-saving" : "ssp-image-growth",
-				text: change > 0 ? ` ${change}% smaller` : ` ${-change}% larger`,
-			});
+		button.setButtonText("Convert all images").setDisabled(waiting === 0);
+		track.toggleClass("ssp-hidden", true);
+		fill.style.width = "0%";
+		label.setText(
+			waiting === 0
+				? "Every image is ready to upload."
+				: `${waiting} image${waiting === 1 ? "" : "s"} still to convert. Continuing converts ${waiting === 1 ? "it" : "them"} first.`
+		);
+	}
+
+	/** Converts every image still waiting, strictly one at a time. Resolves false when stopped. */
+	private async convertAll(): Promise<boolean> {
+		if (this.batch) return false;
+		const rows = this.imageRows.filter((row) => row.pending());
+		const batch = { stop: false };
+		this.batch = batch;
+
+		const progress = this.progress;
+		progress?.button.setButtonText("Stop").setDisabled(false);
+		progress?.track.toggleClass("ssp-hidden", false);
+
+		for (let i = 0; i < rows.length && !batch.stop; i++) {
+			if (progress) {
+				progress.label.setText(`Converting ${i + 1} of ${rows.length} · ${rows[i].name}`);
+				progress.fill.style.width = `${(i / rows.length) * 100}%`;
+			}
+			await rows[i].convert();
 		}
 
-		if (choice && processed.hasAlpha && choice.format === "jpeg") {
-			notes.createDiv({
-				cls: "ssp-warning",
-				text: "This image has see-through areas. JPEG cannot keep them, so they will be filled with white; WebP or the original keeps them.",
-			});
-		}
-		if (size > LARGE_ATTACHMENT) {
-			notes.createDiv({
-				cls: "ssp-warning",
-				text: `${formatBytes(size)} is large for a web page, and GitHub may refuse to commit it. ${
-					!choice
-						? "Consider shrinking it in the vault first."
-						: choice.format === "original"
-							? "Convert it to JPEG or WebP to shrink it."
-							: "Lower the quality to shrink it."
-				}`,
-			});
-		}
+		if (progress) progress.fill.style.width = "100%";
+		this.batch = null;
+		this.showProgressIdle();
+		return !batch.stop;
 	}
 
 	/**
@@ -712,6 +890,31 @@ export class ReviewModal extends Modal {
 			input?.focus();
 			this.focusKeyOf = null;
 		}
+	}
+
+	/**
+	 * Converts any image still waiting before the preview, so the preview and the
+	 * commit only ever see finished images. False when that was stopped or an
+	 * image chosen by hand could not be converted.
+	 */
+	private async convertRemaining(): Promise<boolean> {
+		if (this.batch) {
+			new Notice("Images are still being converted. Wait for them to finish, or stop it first.", 5000);
+			return false;
+		}
+		if (this.imageRows.some((row) => row.pending()) && !(await this.convertAll())) return false;
+
+		const failed = this.imageRows.find((row) => row.failure() !== null);
+		if (failed) {
+			new Notice(`${failed.name} could not be converted (${failed.failure()}). Try again, or choose Original for it.`, 8000);
+			return false;
+		}
+		// Something was changed by hand while the batch ran.
+		if (this.imageRows.some((row) => row.pending())) {
+			new Notice("An image was changed while converting. Convert it again before continuing.", 6000);
+			return false;
+		}
+		return true;
 	}
 
 	/** Blocks the step forward on duplicate property keys or image names, which would silently lose one. */
@@ -950,6 +1153,7 @@ export class ReviewModal extends Modal {
 		if (this.lookupTimer !== null) window.clearTimeout(this.lookupTimer);
 		for (const suggest of this.suggests) suggest.destroy();
 		this.suggests.length = 0;
+		if (this.batch) this.batch.stop = true;
 		for (const url of this.objectUrls) URL.revokeObjectURL(url);
 		this.objectUrls.length = 0;
 		this.contentEl.empty();
