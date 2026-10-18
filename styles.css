@@ -69,13 +69,22 @@
  * native appearance removes the pill entirely and makes the field lay out like
  * an ordinary text box; the pseudo-element rules that follow constrain the
  * parts that survive. Tapping still opens the system picker.
+ *
+ * Without the native appearance, though, nothing gives the field a height:
+ * WebKit sizes it to its text, and an empty date has none, so the field shrinks
+ * to a sliver that still opens the picker. It is given the same height as the
+ * text fields around it outright, rather than left to its contents.
  */
 .ssp-modal input[type="date"],
 .ssp-modal input[type="datetime-local"],
 .ssp-modal input[type="number"] {
+	display: block;
 	width: 100%;
 	min-width: 0;
 	max-width: 100%;
+	height: var(--input-height, 2.25em);
+	min-height: var(--input-height, 2.25em);
+	line-height: normal;
 	-webkit-appearance: none;
 	appearance: none;
 	overflow: hidden;
@@ -86,6 +95,8 @@
 	width: 100%;
 	min-width: 0;
 	max-width: 100%;
+	/* Keeps a line of height even with no date to show. */
+	min-height: 1.5em;
 	margin: 0;
 	text-align: left;
 	white-space: nowrap;
