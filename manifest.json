@@ -1,7 +1,7 @@
 {
   "id": "static-site-publisher",
   "name": "Static Site Publisher",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minAppVersion": "1.11.4",
   "description": "Publish notes as posts to your static site's GitHub repository, rewriting their properties, trimming private content and uploading their images, without touching the source note.",
   "author": "celeryboi",

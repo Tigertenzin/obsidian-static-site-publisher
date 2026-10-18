@@ -1,6 +1,6 @@
 {
   "name": "obsidian-static-site-publisher",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Publish the active Obsidian note to a GitHub repository with transformed frontmatter.",
   "main": "main.js",
   "scripts": {
