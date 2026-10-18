@@ -16,6 +16,8 @@ GitHub](#upgrading-from-publish-to-github).*
   read and write files in that repository. It sends nothing anywhere else and has no telemetry.
 - **The token** is kept in Obsidian's secret storage on your device, never in your vault, and
   never appears in a note, a commit or an error message.
+- **Images are converted on your device.** Resizing and compressing happen inside Obsidian;
+  no image is sent anywhere but your own repository.
 
 ## Why this exists
 
@@ -37,6 +39,9 @@ Everything it does is shaped by that workflow:
   `![[attachments/Pasted image 20260822005058.png|450]]`, which Eleventy cannot render and
   which points at a file the site repository has never seen. The plugin uploads the image and
   rewrites the embed to match.
+- **Photos from a phone are far too big for a web page.** An iPhone photo is 3–5 MB, and
+  GitHub warns about files that size. The plugin converts images to JPEG or WebP and scales
+  them down before uploading, so the same photo goes up at around 150 KB.
 - **The source note stays canonical.** The vault keeps the full note with its own
   properties; only the copy sent to the repository is rewritten.
 - **Posts get republished.** A post is rarely right the first time, so publishing over an
@@ -55,8 +60,8 @@ works the same way. Point the target folder at the site's posts directory (`src/
    of the published copy, laid out for editing. The settings decide what it starts as; from
    there you can change any value, rename or retype any property, drop one with its trash
    button, add a new one that lives nowhere in the settings, and restore anything the settings
-   stripped. It also lists the images it will upload, and spells out what the break marker
-   will cut.
+   stripped. It also lists the images it will upload, where each can be converted and
+   compressed with its own format and quality, and spells out what the break marker will cut.
 2. **Preview window** — shows the exact markdown that will be committed, and where. `Back`
    returns to the review window with your edits intact.
 3. **Overwrite confirmation** — only when a different file is already at that path. See below.
@@ -111,8 +116,8 @@ two such names still stay apart.
 The review window lists every image with its size, the filename it will be uploaded under,
 and an alt text field — a wikilink embed carries no alt text, so this is the place to add it.
 Both are editable, and the resulting URL is shown beneath. A name you type is cleaned the same
-way the automatic ones are — `My Diagram` becomes `my-diagram.png` — keeps the image's own
-extension whatever you type, and cannot include a folder. Clearing the name leaves that embed
+way the automatic ones are — `My Diagram` becomes `my-diagram.png` — keeps the extension of
+the format the image is uploaded in whatever you type, and cannot include a folder. Clearing the name leaves that embed
 exactly as written. Two different images cannot share a name. An image embedded more than once
 is uploaded once: each embed keeps its own alt text, but they share one name, so renaming one
 renames them all. An embed whose file cannot be found
@@ -124,7 +129,8 @@ all: a post never refers to an image that failed to upload, and a failed publish
 repository exactly as it was. The commit message is your template, followed — when images are
 included — by a list of the files it touches and whether each is new or changed. An image
 already in the repository byte for byte is skipped rather than
-committed again — the plugin compares the git blob hash of the local file against the one
+committed again — the plugin compares the git blob hash of the file it would upload, after any
+conversion, against the one
 GitHub reports, reading the hashes for a whole folder in one request rather than downloading
 each image. If the repository cannot be checked, nothing is published.
 
@@ -413,8 +419,10 @@ npm test        # run the unit tests
 ```
 
 The tests in `test/` cover the plugin's own logic — frontmatter and break parsing, attachment
-naming and rendering, syntax conversion, placeholders, the diff, and the single-commit publish
-against an in-memory fake of GitHub's API. Obsidian's API exists only inside the app, so
+naming and rendering, syntax conversion, placeholders, the diff, the single-commit publish
+against an in-memory fake of GitHub's API, and image conversion's choices and its
+one-at-a-time queue. The conversion itself draws on a canvas, which exists only in a browser,
+so it is checked by hand. Obsidian's API exists only inside the app, so
 `test/obsidian.ts` stands in for the few parts of it those modules use. CI runs the type check,
 the tests and the build on every push and pull request, and a release is not published unless
 all three pass.
