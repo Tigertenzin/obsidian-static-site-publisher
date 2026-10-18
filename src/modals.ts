@@ -58,6 +58,10 @@ export interface Attachment {
 	/** Size of the vault file in bytes, 0 when it could not be found. */
 	size: number;
 	missing: boolean;
+	/** The vault file's name, with the extension of the format it is uploaded in. */
+	uploadName: string;
+	/** The type the image is compressed to before uploading, or null when it is sent as it is. */
+	compressTo: string | null;
 }
 
 /** Whether an attachment is already in the repository as it stands in the vault. */
@@ -69,6 +73,8 @@ export interface PlannedUpload {
 	path: string;
 	fileName: string;
 	bytes: ArrayBuffer;
+	/** Size of the vault file, which differs from the bytes when the image was compressed. */
+	originalSize: number;
 	/** SHA of what is at the path now, or null when nothing is. */
 	remoteSha: string | null;
 	status: UploadStatus;
@@ -334,7 +340,13 @@ export class ReviewModal extends Modal {
 
 			if (attachment.missing) continue;
 
-			if (attachment.size > LARGE_ATTACHMENT) {
+			if (attachment.compressTo !== null) {
+				const format = attachment.compressTo.replace("image/", "").toUpperCase();
+				row.createDiv({
+					cls: "ssp-hint",
+					text: `Over the compression limit: it will be scaled down and saved as ${format} before uploading. The image in the vault is not changed.`,
+				});
+			} else if (attachment.size > LARGE_ATTACHMENT) {
 				row.createDiv({
 					cls: "ssp-warning",
 					text: `${formatBytes(
@@ -375,7 +387,7 @@ export class ReviewModal extends Modal {
 				head.createSpan({ cls: "ssp-origin", text: "same image as above" });
 			}
 
-			const originalName = attachment.file?.name ?? "";
+			const originalName = attachment.uploadName;
 			name.setValue(attachment.fileName).onChange((value) => {
 				// The URL shows the cleaned name as it is typed; the field itself is
 				// only tidied on blur, so the cursor is not yanked mid-word.
@@ -849,6 +861,13 @@ export class PreviewModal extends Modal {
 		const list = box.createEl("ul", { cls: "ssp-removed-list" });
 		for (const upload of uploads) {
 			const item = list.createEl("li", { text: `${upload.path} ` });
+			if (upload.bytes.byteLength !== upload.originalSize) {
+				item.createSpan({
+					cls: "ssp-origin",
+					text: `compressed ${formatBytes(upload.originalSize)} → ${formatBytes(upload.bytes.byteLength)}`,
+				});
+				item.appendText(" ");
+			}
 			item.createSpan({ cls: "ssp-origin", text: UPLOAD_STATUS_LABELS[upload.status] });
 		}
 	}

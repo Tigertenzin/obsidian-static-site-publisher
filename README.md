@@ -139,6 +139,19 @@ publishing an `<img src="…" alt="…" width="450">` tag, which any markdown re
 through; set *Image sizes* to `Drop` for plain `![alt](url)` markdown instead. Embeds with no
 size are always plain markdown.
 
+**Large images are compressed.** A photo straight from a phone camera can weigh several
+megabytes. Any JPEG, PNG or WebP over *Compress images over* (500 KB by default) is scaled
+down so its longest edge fits *Maximum width or height* (2000 px), re-encoded at *Image
+quality*, and uploaded in that form; the image in the vault is never changed. A typical
+4032 × 3024 iPhone photo of 3–5 MB comes out at a few hundred kilobytes. The review window
+marks each image that will be compressed, and the preview shows its size before and after.
+By default an image keeps its format, so its name does not change; set *Compressed format*
+to JPEG or WebP to convert instead, which gives the uploaded file the new extension. GIFs
+(which would lose their animation) and SVGs are never touched, and a re-encoding that comes
+out no smaller than the original is dropped for the original. Compression happens on the
+device you publish from, so an image published from two different devices may be re-uploaded
+as *changed* even though the vault copy is the same.
+
 **Video, audio and PDFs.** Markdown image syntax only shows images, so other embeds are
 written in the form that works for them: video as `<video src="…" controls>` (keeping its
 width under the same setting as images), audio as `<audio src="…" controls>`, and a PDF as a
@@ -355,6 +368,11 @@ comment syntax and stays invisible in reading view.
 | Group images by post | Put each post's images in their own subfolder, named after the post. On by default; off puts every image straight into the attachment folder. |
 | Attachment URL prefix | What the rewritten embeds point at — usually the attachment folder with a leading slash, since the site serves it from the root. |
 | Image sizes | Keep an Obsidian size as an `<img width>` tag, or drop it for plain markdown. |
+| Compress large images | Scale down and re-encode images over the size limit before uploading. On by default. |
+| Compress images over (KB) | The size limit. Images at or below it are uploaded exactly as they are. Defaults to 500. |
+| Maximum width or height (px) | The longest edge a compressed image is scaled down to. 0 keeps its size and only re-encodes it. Defaults to 2000. |
+| Image quality | JPEG and WebP quality for compressed images, 10–100. Defaults to 80. PNGs are lossless and only scaled down. |
+| Compressed format | Keep each image's own format, or convert compressed images to JPEG or WebP. WebP falls back to JPEG on devices that cannot write it. |
 
 ## Building
 

@@ -7,6 +7,7 @@ import {
 	rewriteBody,
 	sanitiseAttachmentName,
 } from "./attachments";
+import { canEncode, compressImage, compressionTarget, imageMimeType, withImageExtension } from "./images";
 import { GithubClient, gitBlobSha, type CommitFile, type FolderListing, type RemoteFile } from "./github";
 import {
 	PreviewModal,
@@ -18,6 +19,7 @@ import {
 import {
 	DEFAULT_SETTINGS,
 	StaticSitePublisherSettingTab,
+	imageCompression,
 	type StaticSitePublisherSettings,
 } from "./settings";
 import { expandPlaceholders } from "./placeholders";
@@ -274,6 +276,7 @@ export default class StaticSitePublisherPlugin extends Plugin {
 	private collectAttachments(source: TFile, body: string): Attachment[] {
 		if (!this.settings.uploadAttachments) return [];
 
+		const compression = imageCompression(this.settings);
 		const taken = new Set<string>();
 		// The same image embedded twice is one upload under one name.
 		const nameOf = new Map<string, string>();
@@ -283,13 +286,18 @@ export default class StaticSitePublisherPlugin extends Plugin {
 			// names and full vault paths both land on the right file.
 			const target = this.app.metadataCache.getFirstLinkpathDest(embed.linkpath, source.path);
 
+			// Whether the image is compressed is settled here, from its size, since
+			// converting it changes the extension of the name it is uploaded under.
+			const compressTo = target ? compressionTarget(target.name, target.stat.size, compression, canEncode) : null;
+			const uploadName = target ? withImageExtension(target.name, compressTo) : "";
+
 			let fileName = "";
 			if (target) {
 				const known = nameOf.get(target.path);
 				if (known !== undefined) {
 					fileName = known;
 				} else {
-					fileName = sanitiseAttachmentName(target.name);
+					fileName = sanitiseAttachmentName(uploadName);
 					// Two different images can sanitise to the same name; keep them apart.
 					if (taken.has(fileName)) {
 						const at = fileName.lastIndexOf(".");
@@ -311,6 +319,8 @@ export default class StaticSitePublisherPlugin extends Plugin {
 				alt: embed.alt,
 				size: target?.stat.size ?? 0,
 				missing: target === null,
+				uploadName,
+				compressTo,
 			};
 		});
 	}
@@ -353,7 +363,8 @@ export default class StaticSitePublisherPlugin extends Plugin {
 
 		const plan: PlannedUpload[] = [];
 		for (const [path, attachment] of unique) {
-			const bytes = await this.app.vault.readBinary(attachment.file as TFile);
+			const original = await this.app.vault.readBinary(attachment.file as TFile);
+			const bytes = await this.compressed(attachment, original);
 			const existing = await remoteSha(path);
 			// Without a local hash there is no telling, so it is sent as changed.
 			const local = await gitBlobSha(bytes);
@@ -362,11 +373,33 @@ export default class StaticSitePublisherPlugin extends Plugin {
 				path,
 				fileName: attachment.fileName,
 				bytes,
+				originalSize: original.byteLength,
 				remoteSha: existing,
 				status: existing === null ? "new" : existing === local ? "unchanged" : "changed",
 			});
 		}
 		return plan;
+	}
+
+	/**
+	 * The bytes an image is uploaded as: shrunk when it is over the size limit.
+	 * Kept in its own format, a re-encoding that comes out no smaller, or that
+	 * fails, is dropped for the original. Converted, the new name's extension
+	 * promises the new format, so a failure stops the publish instead.
+	 */
+	private async compressed(attachment: Attachment, original: ArrayBuffer): Promise<ArrayBuffer> {
+		const file = attachment.file as TFile;
+		const inputType = imageMimeType(file.name);
+		if (attachment.compressTo === null || inputType === null) return original;
+
+		const converting = attachment.compressTo !== inputType;
+		try {
+			const bytes = await compressImage(original, inputType, attachment.compressTo, imageCompression(this.settings));
+			return converting || bytes.byteLength < original.byteLength ? bytes : original;
+		} catch (error) {
+			if (converting) throw new Error(`Could not compress ${file.path}: ${(error as Error).message}`);
+			return original;
+		}
 	}
 
 	private openReview(file: TFile, context: ReviewContext) {

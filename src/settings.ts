@@ -1,5 +1,6 @@
 import { App, Notice, PluginSettingTab, SecretComponent, Setting } from "obsidian";
 import type { ImageSizeStyle } from "./attachments";
+import type { CompressedFormat, ImageCompression } from "./images";
 import type { HighlightStyle, NoteLinkStyle } from "./syntax";
 import type StaticSitePublisherPlugin from "./main";
 import { TextSuggest } from "./suggest";
@@ -63,6 +64,15 @@ export interface StaticSitePublisherSettings {
 	groupAttachmentsByPost: boolean;
 	attachmentUrlPrefix: string;
 	imageSizeStyle: ImageSizeStyle;
+	/** Shrink images over the size limit before uploading them. */
+	compressImages: boolean;
+	/** Images larger than this many kilobytes are compressed. */
+	compressAboveKb: number;
+	/** Longest edge, in pixels, a compressed image is scaled down to. 0 keeps its size. */
+	maxImageDimension: number;
+	/** Encoder quality for compressed images, from 1 to 100. */
+	imageQuality: number;
+	compressedFormat: CompressedFormat;
 
 	/**
 	 * The filename each note was last published under, by vault path, so a
@@ -96,9 +106,25 @@ export const DEFAULT_SETTINGS: StaticSitePublisherSettings = {
 	groupAttachmentsByPost: true,
 	attachmentUrlPrefix: "/posts/attachments",
 	imageSizeStyle: "html",
+	compressImages: true,
+	compressAboveKb: 500,
+	maxImageDimension: 2000,
+	imageQuality: 80,
+	compressedFormat: "keep",
 
 	publishedFileNames: {},
 };
+
+/** The compression settings in the form the image module takes them. */
+export function imageCompression(settings: StaticSitePublisherSettings): ImageCompression {
+	return {
+		enabled: settings.compressImages,
+		thresholdBytes: settings.compressAboveKb * 1024,
+		maxDimension: settings.maxImageDimension,
+		quality: Math.min(Math.max(settings.imageQuality, 1), 100) / 100,
+		format: settings.compressedFormat,
+	};
+}
 
 /** What the placeholders are, for the settings that take them. */
 const PLACEHOLDER_HELP =
@@ -662,6 +688,88 @@ export class StaticSitePublisherSettingTab extends PluginSettingTab {
 						await this.save();
 					})
 			);
+
+		new Setting(containerEl)
+			.setName("Compress large images")
+			.setDesc(
+				"Scale down and re-encode images over the size limit before uploading them, so photos straight from a phone camera do not weigh several megabytes. The image in the vault is never changed."
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.compressImages).onChange(async (value) => {
+					this.plugin.settings.compressImages = value;
+					await this.save();
+				})
+			);
+
+		this.renderNumber(containerEl, {
+			name: "Compress images over (KB)",
+			desc: "Images at or below this size are uploaded exactly as they are.",
+			placeholder: "500",
+			get: () => this.plugin.settings.compressAboveKb,
+			set: (value) => (this.plugin.settings.compressAboveKb = value),
+		});
+
+		this.renderNumber(containerEl, {
+			name: "Maximum width or height (px)",
+			desc: "A compressed image is scaled down until its longest edge fits. 0 keeps its full size and only re-encodes it.",
+			placeholder: "2000",
+			get: () => this.plugin.settings.maxImageDimension,
+			set: (value) => (this.plugin.settings.maxImageDimension = value),
+		});
+
+		new Setting(containerEl)
+			.setName("Image quality")
+			.setDesc("Quality of compressed JPEG and WebP images. Lower is smaller. PNGs are lossless and only scaled down.")
+			.addSlider((slider) =>
+				slider
+					.setLimits(10, 100, 5)
+					.setValue(this.plugin.settings.imageQuality)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.imageQuality = value;
+						await this.save();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Compressed format")
+			.setDesc(
+				"What a compressed image is saved as. Converting changes its extension, so the uploaded name changes with it. WebP falls back to JPEG on devices that cannot write it."
+			)
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("keep", "Keep the original format")
+					.addOption("jpeg", "JPEG")
+					.addOption("webp", "WebP")
+					.setValue(this.plugin.settings.compressedFormat)
+					.onChange(async (value) => {
+						this.plugin.settings.compressedFormat = value as CompressedFormat;
+						await this.save();
+					})
+			);
+	}
+
+	/** A whole-number setting; anything that is not one is ignored until it is. */
+	private renderNumber(
+		containerEl: HTMLElement,
+		field: { name: string; desc: string; placeholder: string; get: () => number; set: (value: number) => void }
+	) {
+		new Setting(containerEl)
+			.setName(field.name)
+			.setDesc(field.desc)
+			.addText((text) => {
+				text.inputEl.type = "number";
+				text.inputEl.min = "0";
+				text
+					.setPlaceholder(field.placeholder)
+					.setValue(String(field.get()))
+					.onChange(async (value) => {
+						const parsed = Number(value.trim());
+						if (value.trim().length === 0 || !Number.isInteger(parsed) || parsed < 0) return;
+						field.set(parsed);
+						await this.save();
+					});
+			});
 	}
 }
 
